@@ -1,40 +1,16 @@
-# Enphase to MQTT plugin
-#
-# Author: Wizzard72
-# Versions:
-#   0.0.1: First release
-
 """
-<plugin key="EnphasetoMQTT" name="Enphase-to-MQTT Presence" author="Wizzard72" version="0.0.1" wikilink="https://github.com/Wizzard72/Domoticz-Unifi-Presence">
+    <plugin key="EnphasetoMQTT" name="Enphase-to-MQTT" author="Wizzard72" version="0.0.1" wikilink="https://github.com/Wizzard72/D">
     <description>
         <h2>Enphase to MQTT plugin</h2><br/>
         This plugin reads the Enphase envoy and publish the json output to MQTT.
     </description>
     <params>
-        <param field="Address" label="IP Address / DNS name of the Unifi Controller" width="200px" required="true" default="127.0.0.1"/>
-        <param field="Port" label="Port" width="30px" required="true" default="8443"/>
-        <param field="Username" label="Username" width="200px" required="true" default="admin@unifi.com"/>
-        <param field="Password" label="Password" width="600px" required="true" default="password" password="true"/>
-        <param field="Mode1" label="Site Name" width="200px" required="true" default="default"/>
-        <param field="Mode2" label="MAC Phone Addresses" width="600px" required="true" default="Phone1=1A:2B:3C:4D:5E:6F,Phone2=7A:8B:9C:AD:BE:CF"/>
-        <param field="Mode3" label="Enable Geofencing devices" width="75px">
-            <options>
-                <option label="Yes" value="Yes"/>
-                <option label="No" value="No"  default="true" />
-            </options>
-        </param>
-        <param field="Mode4" label="Select Unifi Controller" width="150px">
-            <options>
-                <option label="Unifi Controller" value="unificontroller" default="true" />
-                <option label="Dream Machine Pro/CloudKey-Gen2" value="dreammachinepro"/>
-            </options>
-        </param>
-        <param field="Mode5" label="Posibility to block devices from the network?" width="75px">
-            <options>
-                <option label="Yes" value="Yes"/>
-                <option label="No" value="No"  default="true" />
-            </options>
-        </param>
+        <param field="Mode1" label="Enphase Envoy IP Address" width="200px" required="true" default="Enphase IP Address"/>
+        <param field="Mode2" label="Enphase Envoy Password" width="200px" required="true" default="password" password="true"/>
+        <param field="Address" label="IP Address or DNS name of the MQTT broker" width="200px" required="true" default="default"/>
+        <param field="Port" label="Port" width="30px" required="true" default="1883"/>
+        <param field="Username" label="MQTT Username" width="200px" required="false" default="Username"/>
+        <param field="Password" label="MQTT Password" width="200px" required="false" default="password"/>
         <param field="Mode6" label="Debug" width="75px">
             <options>
                 <option label="None" value="0"  default="true" />
@@ -50,26 +26,45 @@
 </plugin>
 """
 import Domoticz
-import socket
 import json
-import re
 import requests
-import urllib
+import threading
 import time
-import os
-from requests import Session
-from typing import Pattern, Dict, Union
+from requests.auth import HTTPDigestAuth
 from datetime import datetime
+try:
+    import paho.mqtt.client as mqtt
+except ImportError:
+    print("paho-mqtt module is missing.")
+
 
 
 class BasePlugin:
+    _VERSION_CHECK = None
+    _MQTT_TOPIC = None
+    _MQTT_USERNAME = None
+    _MQTT_CONN = None
+    _MQTT_HOST = None
+    _MQTT_PORT = None
+    _MQTT_PASSWORD = None
+    _ENPHASE_USER = None
+    _ENPHASE_AUTH = None
+    _MARKER = None
 
     def __init__(self):
         return
 
     def onStart(self):
-        strName = "onStart: "
-        Domoticz.Debug(strName+"called")
+        self._MQTT_HOST = Parameters["Address"]
+        self._MQTT_PORT = Parameters["Port"]
+        self._MQTT_TOPIC = "/envoy/json"
+        self._MQTT_USERNAME = Parameters["Username"]
+        self._MQTT_PASSWORD = Parameters["Password"]
+        self._ENPHASE_USER = "installer"
+        self._ENPHASE_AUTH = HTTPDigestAuth(self._ENPHASE_USER, Parameters["Mode2"])
+        self._MARKER = b'data: '
+        _STRNAME = "onStart: "
+        Domoticz.Debug(_STRNAME+"called")
 
         if (Parameters["Mode6"] != "0"):
             Domoticz.Debugging(int(Parameters["Mode6"]))
@@ -89,51 +84,82 @@ class BasePlugin:
         except Exception as err:
             Domoticz.Error("Domoticz version check returned an error: {}. Plugin is therefore disabled".format(err))
             self.setVersionCheck(False, "onStart")
-        if not self.versionCheck:
+        if not self._VERSION_CHECK:
             return
 
+        self.mqtt_conn()
+        Domoticz.Heartbeat(10)
+
     def onStop(self):
-        strName = "onStop: "
-        Domoticz.Debug(strName+"Pluggin is stopping.")
+        _STRNAME = "onStop: "
+        Domoticz.Debug(_STRNAME+"Pluggin is stopping.")
 
     def onConnect(self, Connection, Status, Description):
-        strName = "onConnect: "
-        Domoticz.Debug(strName+"called")
-        Domoticz.Debug(strName+"Connection = "+str(Connection))
-        Domoticz.Debug(strName+"Status = "+str(Status))
-        Domoticz.Debug(strName+"Description = "+str(Description))
+        _STRNAME = "onConnect: "
+        Domoticz.Debug(_STRNAME+"called")
+        Domoticz.Debug(_STRNAME+"Connection = "+str(Connection))
+        Domoticz.Debug(_STRNAME+"Status = "+str(Status))
+        Domoticz.Debug(_STRNAME+"Description = "+str(Description))
 
     def onMessage(self, Connection, Data):
-        strName = "onMessage: "
+        _STRNAME = "onMessage: "
         Domoticz.Debug(strName+"called")
         DumpHTTPResponseToLog(Data)
-        Domoticz.Debug(strName+"Data = " +str(Data))
+        Domoticz.Debug(_STRNAME+"Data = " +str(Data))
         strData = Data["Data"].decode("utf-8", "ignore")
         status = int(Data["Status"])
 
-        if (self._current_status_code == 200 or self._current_status_code == 404):
-            unifiResponse = json.loads(strData)
-            Domoticz.Debug(strName+"Retrieved following json: "+json.dumps(unifiResponse))
-            self.onHeartbeat()
 
     def onCommand(self, Unit, Command, Level, Hue):
-        strName = "onCommand: "
-        Domoticz.Log(strName+"called for Unit " + str(Unit) + ": Parameter '" + str(Command) + "', Level: " + str(Level))
+        _STRNAME = "onCommand: "
+        Domoticz.Log(_STRNAME+"called for Unit " + str(Unit) + ": Parameter '" + str(Command) + "', Level: " + str(Level))
         #if self.versionCheck is True:
 
     def onNotification(self, Name, Subject, Text, Status, Priority, Sound, ImageFile):
-        strName = "onNotification: "
-        Domoticz.Debug(strName+"called")
-        Domoticz.Log(strName+"Notification: " + Name + "," + Subject + "," + Text + "," + Status + "," + str(Priority) + "," + Sound + "," + ImageFile)
+        _STRNAME = "onNotification: "
+        Domoticz.Debug(_STRNAME+"called")
+        Domoticz.Log(_STRNAME+"Notification: " + Name + "," + Subject + "," + Text + "," + Status + "," + str(Priority) + "," + Sound + "," + ImageFile)
 
     def onDisconnect(self, Connection):
-        strName = "onDisconnect: "
-        Domoticz.Debug(strName+"called")
+        _STRNAME = "onDisconnect: "
+        Domoticz.Debug(_STRNAME+"called")
 
     def onHeartbeat(self):
-        strName = "onHeartbeat: "
-        Domoticz.Debug(strName+"called")
-        #if self.versionCheck is True:
+        _STRNAME = "onHeartbeat: "
+        Domoticz.Debug(_STRNAME+"called")
+        self.enphase_stream()
+        #if self._VERSION_CHECK is True:
+
+
+    def setVersionCheck(self, value, note):
+        _STRNAME = "setVersionCheck - "
+        if value is True:
+            if self._VERSION_CHECK is not False:
+                self._VERSION_CHECK = True
+                Domoticz.Log("Plugin allowed to start (triggered by: "+note+")")
+        elif value is False:
+            self._VERSION_CHECK = False
+            Domoticz.Error("Plugin NOT allowed to start (triggered by: "+note+")")
+
+    def mqtt_conn(self):
+        _STRNAME = "mqtt_conn :"
+        self._MQTT_CONN = mqtt.Client()
+        self._MQTT_CONN.username_pw_set(self._MQTT_USERNAME, self._MQTT_PASSWORD)
+        self._MQTT_CONN.connect(self._MQTT_HOST, int(self._MQTT_PORT), 30)
+        self._MQTT_CONN.loop_start()
+
+    def enphase_stream(self):
+        _STRNAME = "enphase_stream: "
+        _URL = "http://%s/stream/meter" % Parameters["Mode1"]
+        Domoticz.Log("URL = "+_URL)
+        stream_meter = requests.get(_URL, auth=self._ENPHASE_AUTH, stream=True, timeout=5)
+        for item in stream_meter.iter_lines():
+            if item.startswith(self._MARKER):
+                json_data = json.loads(item.replace(self._MARKER, b''))
+                json_string= json.dumps(json_data)
+                #Domoticz.Log(_STRNAME+"JSON: "+json_string)
+                self._MQTT_CONN.publish(topic=self._MQTT_TOPIC, payload=json_string, qos=0)
+
 
 global _plugin
 _plugin = BasePlugin()
@@ -171,59 +197,59 @@ def onHeartbeat():
     _plugin.onHeartbeat()
 
 def LogMessage(Message):
-    strName = "LogMessage: "
+    _STRNAME = "LogMessage: "
     if Parameters["Mode6"] == "File":
         f = open(Parameters["HomeFolder"]+"http.html","w")
         f.write(Message)
         f.close()
-        Domoticz.Debug(strName+"File written")
+        Domoticz.Debug(_STRNAME+"File written")
 
 def DumpHTTPResponseToLog(httpResp, level=0):
-    strName = "DumpHTTPResponseToLog: "
-    if (level==0): Domoticz.Debug(strName+"HTTP Details ("+str(len(httpResp))+"):")
+    _STRNAME = "DumpHTTPResponseToLog: "
+    if (level==0): Domoticz.Debug(_STRNAME+"HTTP Details ("+str(len(httpResp))+"):")
     indentStr = ""
     for x in range(level):
         indentStr += "----"
     if isinstance(httpResp, dict):
         for x in httpResp:
             if not isinstance(httpResp[x], dict) and not isinstance(httpResp[x], list):
-                Domoticz.Debug(strName+indentStr + ">'" + x + "':'" + str(httpResp[x]) + "'")
+                Domoticz.Debug(_STRNAME+indentStr + ">'" + x + "':'" + str(httpResp[x]) + "'")
             else:
-                Domoticz.Debug(strName+indentStr + ">'" + x + "':")
+                Domoticz.Debug(_STRNAME+indentStr + ">'" + x + "':")
                 DumpHTTPResponseToLog(httpResp[x], level+1)
     elif isinstance(httpResp, list):
         for x in httpResp:
-            Domoticz.Debug(strName+indentStr + "['" + x + "']")
+            Domoticz.Debug(_STRNAME+indentStr + "['" + x + "']")
     else:
-        Domoticz.Debug(strName+indentStr + ">'" + x + "':'" + str(httpResp[x]) + "'")
+        Domoticz.Debug(_STRNAME+indentStr + ">'" + x + "':'" + str(httpResp[x]) + "'")
 
 def is_whole(n):
     return n % 1 == 0
 
 def UpdateDevice(Unit, nValue, sValue, Image=None):
-    strName = "UpdateDevice: "
+    _STRNAME = "UpdateDevice: "
     # Make sure that the Domoticz device still exists (they can be deleted) before updating it 
     if (Unit in Devices):
         if (Devices[Unit].nValue != nValue) or (Devices[Unit].sValue != sValue) or ((Image != None) and (Image != Devices[Unit].Image)):
             if (Image != None) and (Image != Devices[Unit].Image):
                 Devices[Unit].Update(nValue=nValue, sValue=str(sValue), Image=Image)
-                Domoticz.Log(strName+"Update "+str(nValue)+":'"+str(sValue)+"' ("+Devices[Unit].Name+") Image="+str(Image))
+                Domoticz.Log(_STRNAME+"Update "+str(nValue)+":'"+str(sValue)+"' ("+Devices[Unit].Name+") Image="+str(Image))
             else:
                 Devices[Unit].Update(nValue=nValue, sValue=str(sValue))
-                Domoticz.Log(strName+"Update "+str(nValue)+":'"+str(sValue)+"' ("+Devices[Unit].Name+")")
+                Domoticz.Log(_STRNAME+"Update "+str(nValue)+":'"+str(sValue)+"' ("+Devices[Unit].Name+")")
 
     # Generic helper functions
 def DumpConfigToLog():
-    strName = "DumpConfigToLog: "
+    _STRNAME = "DumpConfigToLog: "
     for x in Parameters:
         if Parameters[x] != "":
-            Domoticz.Debug(strName+"'" + x + "':'" + str(Parameters[x]) + "'")
+            Domoticz.Debug(_STRNAME+"'" + x + "':'" + str(Parameters[x]) + "'")
     Domoticz.Debug("Device count: " + str(len(Devices)))
     for x in Devices:
-        Domoticz.Debug(strName+"Device:           " + str(x) + " - " + str(Devices[x]))
-        Domoticz.Debug(strName+"Device ID:       '" + str(Devices[x].ID) + "'")
-        Domoticz.Debug(strName+"Device Name:     '" + Devices[x].Name + "'")
-        Domoticz.Debug(strName+"Device nValue:    " + str(Devices[x].nValue))
-        Domoticz.Debug(strName+"Device sValue:   '" + Devices[x].sValue + "'")
-        Domoticz.Debug(strName+"Device LastLevel: " + str(Devices[x].LastLevel))
+        Domoticz.Debug(_STRNAME+"Device:           " + str(x) + " - " + str(Devices[x]))
+        Domoticz.Debug(_STRNAME+"Device ID:       '" + str(Devices[x].ID) + "'")
+        Domoticz.Debug(_STRNAME+"Device Name:     '" + Devices[x].Name + "'")
+        Domoticz.Debug(_STRNAME+"Device nValue:    " + str(Devices[x].nValue))
+        Domoticz.Debug(_STRNAME+"Device sValue:   '" + Devices[x].sValue + "'")
+        Domoticz.Debug(_STRNAME+"Device LastLevel: " + str(Devices[x].LastLevel))
     return
